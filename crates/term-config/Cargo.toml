@@ -1,0 +1,10 @@
+[package]
+name = "miao-term-config"
+description = "Config and themes, with ghostty/alacritty import"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

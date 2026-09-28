@@ -1,0 +1,10 @@
+[package]
+name = "miao-term-mtp"
+description = "MTP control plane: protocol + host/client + transport (Unix socket / Windows named pipe)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
