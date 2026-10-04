@@ -38,7 +38,7 @@ fn record(dir: PathBuf) {
     let _ = append(
         &path,
         &json!({
-            "type": "start", "schema": 1, "t": now_ms(), "pid": std::process::id(),
+            "type": "start", "schema": 2, "t": now_ms(), "pid": std::process::id(),
             "version": env!("CARGO_PKG_VERSION"), "platform": std::env::consts::OS,
             "arch": std::env::consts::ARCH, "intervalMs": INTERVAL.as_millis(),
             "logicalCpus": std::thread::available_parallelism().ok().map(|n| n.get()),
@@ -58,6 +58,7 @@ fn record(dir: PathBuf) {
         });
         previous = cpu.map(|cpu| (sampled, cpu));
         let (frames, render_us) = miao_term_widget::resource_metrics::snapshot();
+        let (main_frames, pip_frames) = miao_term_widget::resource_metrics::presentation_snapshot();
         sample["type"] = json!("sample");
         sample["t"] = json!(now_ms());
         sample["pid"] = json!(std::process::id());
@@ -65,6 +66,8 @@ fn record(dir: PathBuf) {
         sample["cpuPercent"] = json!(percent);
         sample["renderCalls"] = json!(frames);
         sample["renderWallUs"] = json!(render_us);
+        sample["mainPresentedFrames"] = json!(main_frames);
+        sample["pipPresentedFrames"] = json!(pip_frames);
         let _ = append(&path, &sample);
         std::thread::sleep(INTERVAL);
     }

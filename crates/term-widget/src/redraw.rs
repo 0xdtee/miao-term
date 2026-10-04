@@ -13,10 +13,16 @@ pub(crate) struct Redraw {
 }
 
 impl Redraw {
+    /// Mark work without immediately waking the window again. Timers use this
+    /// so an overdue hover/drag cannot spin on rejected OS redraw events.
+    pub(crate) fn request(&mut self) {
+        self.pending = true;
+    }
+
     /// An OS redraw may arrive for every PTY wake or pointer movement. Keep
     /// the newest state pending until a frame is due; never discard a redraw.
     pub(crate) fn begin(&mut self, now: Instant, focused: bool, drawable: bool) -> bool {
-        self.pending = true;
+        self.request();
         if !self
             .deadline(now, focused, drawable)
             .is_some_and(|at| at <= now)
@@ -145,5 +151,21 @@ mod tests {
             assert!(redraw.begin(at, focused, true));
             assert_eq!(redraw.deadline(at, focused, true), None);
         }
+    }
+
+    #[test]
+    fn overdue_timer_requests_wait_for_the_frame_budget() {
+        let now = Instant::now();
+        let mut redraw = Redraw::default();
+        assert!(redraw.begin(now, true, true));
+        for ms in 1..=16 {
+            redraw.request();
+            assert_eq!(
+                redraw.deadline(now + Duration::from_millis(ms), true, true),
+                Some(now + FOREGROUND_FRAME)
+            );
+        }
+        assert!(redraw.begin(now + FOREGROUND_FRAME, true, true));
+        assert_eq!(redraw.deadline(now + FOREGROUND_FRAME, true, true), None);
     }
 }

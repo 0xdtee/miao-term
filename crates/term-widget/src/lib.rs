@@ -1718,6 +1718,8 @@ struct State {
     /// The pointer is known while dragging (see `drag`): the open band is
     /// offered.
     drag_live: bool,
+    /// Next native drag pointer poll; repainting must not itself poll again.
+    drag_wake: Option<Instant>,
     /// What the current drop does, decided at its first file so a drop of
     /// several is handled alike (opening one changes the tab under the
     /// pointer).
@@ -2787,6 +2789,7 @@ impl State {
 
     /// Render the active pane into the PiP window.
     fn render_pip(&mut self) {
+        let _render_timer = resource_metrics::RenderTimer::start();
         let Some(pip) = self.pip.as_mut() else {
             return;
         };
@@ -2797,7 +2800,6 @@ impl State {
         ) {
             return;
         }
-        let _render_timer = resource_metrics::RenderTimer::start();
         let theme = self.theme.clone();
         let scale = pip.window.scale_factor() as f32;
         let win_size = (pip.config.width, pip.config.height);
@@ -2858,6 +2860,7 @@ impl State {
         }
         self.queue.submit(Some(enc.finish()));
         frame.present();
+        resource_metrics::presented(true);
     }
 
     /// Close one pane by id (drops its tab when it was the last one).
@@ -3490,6 +3493,7 @@ impl State {
     }
 
     fn render(&mut self) {
+        let _render_timer = resource_metrics::RenderTimer::start();
         let frame_start = Instant::now();
         if !self.redraw.begin(
             frame_start,
@@ -3498,14 +3502,13 @@ impl State {
         ) {
             return;
         }
-        let _render_timer = resource_metrics::RenderTimer::start();
         if self.focused {
             if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                 tab.attention = Attention::seen(tab.attention);
             }
         }
         self.refresh_search();
-        self.lsp_frame();
+        self.maybe_request_hover();
         self.poll_details();
         self.ensure_details();
 
@@ -3944,6 +3947,7 @@ impl State {
         }
         self.queue.submit(Some(encoder.finish()));
         frame.present();
+        resource_metrics::presented(false);
         for id in &output.textures_delta.free {
             self.egui_renderer.free_texture(id);
         }
@@ -7754,7 +7758,6 @@ impl State {
         for event in self.lsp.poll() {
             self.lsp_event(event);
         }
-        self.maybe_request_hover();
     }
 
     /// Send the active editor's latest text before asking about it.
@@ -14642,6 +14645,7 @@ impl ApplicationHandler<HostEvent> for Host {
             dropping: false,
             drag_paths: Vec::new(),
             drag_live: false,
+            drag_wake: None,
             drop_choice: None,
             qa_drag: None,
             divider_drag: None,
@@ -14907,7 +14911,7 @@ impl ApplicationHandler<HostEvent> for Host {
         };
         match event {
             // PTY output / MTP work: just repaint.
-            HostEvent::Wake => state.window.request_redraw(),
+            HostEvent::Wake => state.redraw.request(),
             // Global Quick Terminal hotkey (ADR 0019): one press toggles the
             // Quick tab and brings the window forward. This event is the only
             // trigger; the hotkey's pending flag is not polled as well.
@@ -14930,6 +14934,9 @@ impl ApplicationHandler<HostEvent> for Host {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(state) = &mut self.state {
             state.poll_control_plane();
+            // LSP events and document changes are control-plane work too;
+            // hidden editors must not accumulate an undrained event queue.
+            state.lsp_frame();
             #[cfg(all(unix, not(target_os = "macos")))]
             {
                 let events = state.dnd.as_mut().map(|d| d.poll()).unwrap_or_default();
@@ -15005,12 +15012,18 @@ impl ApplicationHandler<HostEvent> for Host {
             // A file drag sends no pointer motion or key events: follow the
             // pointer and Alt from the system so the drop targets track them.
             if drawable && state.dropping && state.qa_drag.is_none() {
-                if let Some(at) = drag::pointer_in_window(&state.window) {
-                    state.cursor = at;
-                    state.drag_live = true;
+                let now = Instant::now();
+                if now >= state.drag_wake.unwrap_or(now) {
+                    if let Some(at) = drag::pointer_in_window(&state.window) {
+                        state.cursor = at;
+                        state.drag_live = true;
+                    }
+                    state.redraw.request();
+                    state.drag_wake = Some(now + Duration::from_millis(30));
                 }
-                state.window.request_redraw();
-                wake_at = wake_at.min(Instant::now() + Duration::from_millis(30));
+                wake_at = wake_at.min(state.drag_wake.unwrap());
+            } else {
+                state.drag_wake = None;
             }
             if let Some(at) = state.image_wake.filter(|_| drawable) {
                 if Instant::now() >= at {
@@ -15121,7 +15134,7 @@ impl ApplicationHandler<HostEvent> for Host {
             if let Some(rest) = state.hover_rest.as_ref().filter(|r| drawable && !r.asked) {
                 let due = rest.since + HOVER_DELAY;
                 if Instant::now() >= due {
-                    state.window.request_redraw();
+                    state.redraw.request();
                 } else {
                     wake_at = wake_at.min(due);
                 }
