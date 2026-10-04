@@ -4,7 +4,7 @@ Status: accepted.
 
 ## Context
 
-The engine (`miao-term-*`) must be embeddable by third parties, and the app
+The engine (`mtty-*`) must be embeddable by third parties, and the app
 (`miaotty-app`) is its first consumer. The Rust ecosystem we build on is
 overwhelmingly permissively licensed, but some transitive crates are
 dual-licensed with a copyleft *option* (e.g. `Apache-2.0 OR GPL-2.0-only`).
@@ -47,7 +47,7 @@ simply absent from the list above, and are added to it:
 | `Apache-2.0 WITH LLVM-exception` | `target-lexicon` | The exception is strictly more permissive than `Apache-2.0`; the expression is not the bare `Apache-2.0` already listed, which is why it was rejected. |
 
 The fourth was a genuine violation: **`serialport`, a direct dependency of
-`miao-term-ui`, is `MPL-2.0`** — weak copyleft, which this ADR excludes. It had
+`mtty-ui`, is `MPL-2.0`** — weak copyleft, which this ADR excludes. It had
 been recorded as MIT since the day it was added, and the wrong claim had been
 copied into ADR 0037 and the manifest comment without anyone checking.
 
@@ -67,7 +67,7 @@ Attack, is a timing side channel in `rsa`'s *decryption*, and no fixed release
 exists. mtty reaches `rsa` only through `ssh-key`, and only to parse and
 re-encode a private key: the workspace calls `PrivateKey::from_openssh` and
 `to_openssh` and nothing else, and contains no `sign`, `verify` or RSA-decrypt
-call at all — the single `decrypt` in `term-keys` is the PuTTY `.ppk`'s own
+call at all — the single `decrypt` in `mtty-keys` is the PuTTY `.ppk`'s own
 AES-256-CBC. The crate is linked into the binary; the vulnerable operation is
 not on any path from this code. `deny.toml` records that reasoning beside the
 exception, with the date, and a note to re-examine it when `ssh-key` is

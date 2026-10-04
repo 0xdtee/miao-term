@@ -12,7 +12,7 @@ Linux shells out to `wl-paste`/`xclip`, Windows to PowerShell.
 The host already reads the pasteboard for text pastes, and the existing
 convention for an image-only clipboard is an empty bracketed paste that tells
 the application to fetch the image on its own
-(`crates/term-widget/src/lib.rs`, `paste_clipboard`).
+(`crates/mtty-widget/src/lib.rs`, `paste_clipboard`).
 
 ## Decision
 
@@ -22,7 +22,7 @@ The host owns the clipboard image and hands it to the pane through a file:
   directory — into the panes' environment, next to `MTTY_CLI`/`MTTY_SOCKET`
   (`export_pane_environment`).
 - On paste, when the clipboard holds an image, `paste_clipboard` reads it
-  (`miao-term-platform::clipboard_image`, macOS `NSPasteboard`), writes the PNG
+  (`mtty-platform::clipboard_image`, macOS `NSPasteboard`), writes the PNG
   to that path, and sends the empty bracketed paste the application already
   treats as "read the clipboard".
 - A text paste removes the file first, so a later empty paste cannot read a
