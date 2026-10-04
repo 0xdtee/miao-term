@@ -4,6 +4,8 @@ use std::time::Instant;
 
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 static RENDER_US: AtomicU64 = AtomicU64::new(0);
+static MAIN_PRESENTED: AtomicU64 = AtomicU64::new(0);
+static PIP_PRESENTED: AtomicU64 = AtomicU64::new(0);
 
 pub struct RenderTimer(Instant);
 
@@ -25,5 +27,20 @@ pub fn snapshot() -> (u64, u64) {
     (
         FRAMES.load(Ordering::Relaxed),
         RENDER_US.load(Ordering::Relaxed),
+    )
+}
+
+/// Count only frames handed to the surface, not rejected redraws, missing PiP
+/// windows, or failed surface acquisition. This is not GPU execution time.
+pub(crate) fn presented(pip: bool) {
+    let frames = if pip { &PIP_PRESENTED } else { &MAIN_PRESENTED };
+    frames.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Cumulative main-window and picture-in-picture surface presentations.
+pub fn presentation_snapshot() -> (u64, u64) {
+    (
+        MAIN_PRESENTED.load(Ordering::Relaxed),
+        PIP_PRESENTED.load(Ordering::Relaxed),
     )
 }

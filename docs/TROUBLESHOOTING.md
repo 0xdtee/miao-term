@@ -25,6 +25,15 @@ or failed probes are `null`, not zero. These samples describe mtty itself,
 not its PTY hosts or shell/agent child processes. RSS is not the same metric as
 macOS Activity Monitor's memory footprint.
 
+Recorder schema 2 additionally reports `mainPresentedFrames` and
+`pipPresentedFrames`: cumulative frames submitted to each surface after a
+successful acquisition. Divide their consecutive differences by elapsed seconds
+to measure presentation rate. `renderCalls` still counts attempts, including
+deferred or hidden redraws, so it must not be interpreted as FPS. Schema 1 also
+counted the early-return PiP call after every main-window render, even without a
+PiP window. `renderWallUs` includes CPU preparation and presentation waits, not
+GPU busy time; vsync can increase that wait while reducing GPU submissions.
+
 Compare consecutive records: rising CPU time with unchanged render counters
 points toward non-render work; rising render counts during an otherwise idle
 period points toward unwanted refreshes. Observe memory across repeated similar

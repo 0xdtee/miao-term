@@ -43,6 +43,7 @@ mod drag;
 mod editor_pane;
 #[cfg(target_os = "macos")]
 mod macos_url;
+mod redraw;
 pub mod resource_metrics;
 mod session;
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -1707,6 +1708,8 @@ struct State {
     /// The pointer is known while dragging (see `drag`): the open band is
     /// offered.
     drag_live: bool,
+    /// Next native drag pointer poll; repainting must not itself poll again.
+    drag_wake: Option<Instant>,
     /// What the current drop does, decided at its first file so a drop of
     /// several is handled alike (opening one changes the tab under the
     /// pointer).
@@ -1933,6 +1936,8 @@ struct State {
     prompt_input: String,
     last_title: Option<String>,
     focused: bool,
+    occluded: bool,
+    redraw: redraw::Redraw,
     cursor_on: bool,
     last_blink: Instant,
     image_wake: Option<Instant>,
@@ -1943,6 +1948,17 @@ struct State {
     egui_renderer: egui_wgpu::Renderer,
 }
 
+/// Some platforms report minimized windows with their old nonzero size, so
+/// size alone must not keep submitting GPU work to a hidden surface.
+fn window_drawable(window: &Window, occluded: bool) -> bool {
+    let size = window.inner_size();
+    !occluded
+        && size.width > 0
+        && size.height > 0
+        && window.is_visible() != Some(false)
+        && window.is_minimized() != Some(true)
+}
+
 /// An always-on-top window mirroring the active pane (read-only).
 struct Pip {
     window: Arc<Window>,
@@ -1950,6 +1966,8 @@ struct Pip {
     config: wgpu::SurfaceConfiguration,
     quads: QuadRenderer,
     renderer: TermRenderer,
+    occluded: bool,
+    redraw: redraw::Redraw,
 }
 
 #[derive(Default)]
@@ -2722,7 +2740,7 @@ impl State {
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoNoVsync,
+            present_mode: wgpu::PresentMode::AutoVsync,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 1,
@@ -2736,6 +2754,8 @@ impl State {
             config,
             quads,
             renderer,
+            occluded: false,
+            redraw: redraw::Redraw::default(),
         });
         self.window.request_redraw();
     }
@@ -2763,6 +2783,13 @@ impl State {
         let Some(pip) = self.pip.as_mut() else {
             return;
         };
+        if !pip.redraw.begin(
+            Instant::now(),
+            pip.window.has_focus(),
+            window_drawable(&pip.window, pip.occluded),
+        ) {
+            return;
+        }
         let theme = self.theme.clone();
         let scale = pip.window.scale_factor() as f32;
         let win_size = (pip.config.width, pip.config.height);
@@ -2823,6 +2850,7 @@ impl State {
         }
         self.queue.submit(Some(enc.finish()));
         frame.present();
+        resource_metrics::presented(true);
     }
 
     /// Close one pane by id (drops its tab when it was the last one).
@@ -2926,8 +2954,13 @@ impl State {
             .filter(|p| p.term.exited())
             .map(|p| p.id.clone())
             .collect();
+        let closed = !ids.is_empty();
         for id in ids {
             self.close_pane_id(&id);
+        }
+        if closed {
+            self.retain_live_renderers();
+            self.window.request_redraw();
         }
     }
 
@@ -3374,20 +3407,14 @@ impl State {
             .unwrap_or_else(|| tab.title.clone())
     }
 
-    fn render(&mut self) {
-        let _render_timer = resource_metrics::RenderTimer::start();
-        self.save_scrollback_periodically();
-        if self.focused {
-            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                tab.attention = Attention::seen(tab.attention);
-            }
-        }
-        self.refresh_search();
-        self.lsp_frame();
-        self.poll_details();
-        self.ensure_details();
+    /// Keep terminal control independent of painting: occluded/minimized
+    /// windows still accept MTP input, commands, and session housekeeping.
+    fn poll_control_plane(&mut self) {
+        let writes = self.mtp.take_writes();
+        let commands = self.mtp.take_commands();
+        let changed = !writes.is_empty() || !commands.is_empty();
         // MTP `pane.send` / `pane.run` — inject bytes into the target pane.
-        for (pane_id, data) in self.mtp.take_writes() {
+        for (pane_id, data) in writes {
             for tab in &mut self.tabs {
                 if let Some(p) = tab.panes.iter_mut().find(|p| p.id == pane_id) {
                     p.term.write(&data);
@@ -3404,7 +3431,7 @@ impl State {
             }
         }
         // MTP `pane.focus` / `pane.close` / `app.view` / `app.edit`.
-        for command in self.mtp.take_commands() {
+        for command in commands {
             match command {
                 mtty_mtp::Command::Focus(id) => {
                     let found = self.tabs.iter().position(|t| t.has_pane(&id));
@@ -3446,13 +3473,34 @@ impl State {
                 }
             }
         }
-        // Drain every pane (see `Pane::drain_output`).
-        for tab in &mut self.tabs {
-            for pane in &mut tab.panes {
-                pane.drain_output();
+        if changed {
+            self.retain_live_renderers();
+            self.window.request_redraw();
+            if let Some(pip) = &self.pip {
+                pip.window.request_redraw();
             }
         }
-        self.reap_exited();
+    }
+
+    fn render(&mut self) {
+        let _render_timer = resource_metrics::RenderTimer::start();
+        let frame_start = Instant::now();
+        if !self.redraw.begin(
+            frame_start,
+            self.focused,
+            window_drawable(&self.window, self.occluded),
+        ) {
+            return;
+        }
+        if self.focused {
+            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                tab.attention = Attention::seen(tab.attention);
+            }
+        }
+        self.refresh_search();
+        self.maybe_request_hover();
+        self.poll_details();
+        self.ensure_details();
 
         // Sync the window title from the active pane's OSC 0/2.
         let title = self
@@ -3792,14 +3840,14 @@ impl State {
         let events = raw.events.clone();
         let egui_ctx = self.egui_ctx.clone();
         let output = egui_ctx.run(raw, |ctx| self.chrome(ctx));
-        // egui asks for an immediate repaint when a widget changed (e.g. a
-        // clicked tab). Honour it, otherwise the new state only shows on the
-        // next OS event or the cursor-blink tick — which reads as lag.
-        let repaint_now = output
+        // Honour delayed animations as well as immediate widget changes,
+        // without a self-sustaining, uncapped request_redraw loop.
+        let repaint_delay = output
             .viewport_output
             .get(&egui::ViewportId::ROOT)
-            .map(|v| v.repaint_delay.is_zero())
-            .unwrap_or(false);
+            .map(|v| v.repaint_delay)
+            .unwrap_or(Duration::MAX);
+        self.redraw.repaint_after(frame_start, repaint_delay);
         // A press on a panel edge belongs to the UI (see `resize_cursor`).
         self.ui_resize_hover = chrome::resize_cursor(output.platform_output.cursor_icon);
         let mut platform_output = output.platform_output;
@@ -3889,6 +3937,7 @@ impl State {
         }
         self.queue.submit(Some(encoder.finish()));
         frame.present();
+        resource_metrics::presented(false);
         for id in &output.textures_delta.free {
             self.egui_renderer.free_texture(id);
         }
@@ -3911,10 +3960,9 @@ impl State {
                 _ => {}
             }
         }
-        if repaint_now {
-            self.window.request_redraw();
+        if let Some(pip) = &self.pip {
+            pip.window.request_redraw();
         }
-        self.render_pip();
         self.retain_live_renderers();
     }
 
@@ -7683,7 +7731,6 @@ impl State {
         for event in self.lsp.poll() {
             self.lsp_event(event);
         }
-        self.maybe_request_hover();
     }
 
     /// Send the active editor's latest text before asking about it.
@@ -14462,7 +14509,7 @@ impl ApplicationHandler<HostEvent> for Host {
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoNoVsync,
+            present_mode: wgpu::PresentMode::AutoVsync,
             alpha_mode: pick_alpha_mode(&caps.alpha_modes, opacity < 1.0),
             view_formats: vec![],
             desired_maximum_frame_latency: 1,
@@ -14558,6 +14605,7 @@ impl ApplicationHandler<HostEvent> for Host {
             dropping: false,
             drag_paths: Vec::new(),
             drag_live: false,
+            drag_wake: None,
             drop_choice: None,
             qa_drag: None,
             divider_drag: None,
@@ -14754,6 +14802,8 @@ impl ApplicationHandler<HostEvent> for Host {
             prompt_input: String::new(),
             last_title: None,
             focused: false,
+            occluded: false,
+            redraw: redraw::Redraw::default(),
             cursor_on: true,
             last_blink: Instant::now(),
             image_wake: None,
@@ -14821,7 +14871,7 @@ impl ApplicationHandler<HostEvent> for Host {
         };
         match event {
             // PTY output / MTP work: just repaint.
-            HostEvent::Wake => state.window.request_redraw(),
+            HostEvent::Wake => state.redraw.request(),
             // Global Quick Terminal hotkey (ADR 0019): one press toggles the
             // Quick tab and brings the window forward. This event is the only
             // trigger; the hotkey's pending flag is not polled as well.
@@ -14843,6 +14893,10 @@ impl ApplicationHandler<HostEvent> for Host {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(state) = &mut self.state {
+            state.poll_control_plane();
+            // LSP events and document changes are control-plane work too;
+            // hidden editors must not accumulate an undrained event queue.
+            state.lsp_frame();
             #[cfg(all(unix, not(target_os = "macos")))]
             {
                 let events = state.dnd.as_mut().map(|d| d.poll()).unwrap_or_default();
@@ -14907,19 +14961,31 @@ impl ApplicationHandler<HostEvent> for Host {
             }
             if changed {
                 state.window.request_redraw();
+                if let Some(pip) = &state.pip {
+                    pip.window.request_redraw();
+                }
             }
+            state.reap_exited();
+            state.save_scrollback_periodically();
+            let drawable = window_drawable(&state.window, state.occluded);
             let mut wake_at = Instant::now() + Duration::from_millis(500);
             // A file drag sends no pointer motion or key events: follow the
             // pointer and Alt from the system so the drop targets track them.
-            if state.dropping && state.qa_drag.is_none() {
-                if let Some(at) = drag::pointer_in_window(&state.window) {
-                    state.cursor = at;
-                    state.drag_live = true;
+            if drawable && state.dropping && state.qa_drag.is_none() {
+                let now = Instant::now();
+                if now >= state.drag_wake.unwrap_or(now) {
+                    if let Some(at) = drag::pointer_in_window(&state.window) {
+                        state.cursor = at;
+                        state.drag_live = true;
+                    }
+                    state.redraw.request();
+                    state.drag_wake = Some(now + Duration::from_millis(30));
                 }
-                state.window.request_redraw();
-                wake_at = wake_at.min(Instant::now() + Duration::from_millis(30));
+                wake_at = wake_at.min(state.drag_wake.unwrap());
+            } else {
+                state.drag_wake = None;
             }
-            if let Some(at) = state.image_wake {
+            if let Some(at) = state.image_wake.filter(|_| drawable) {
                 if Instant::now() >= at {
                     state.image_wake = None;
                     state.window.request_redraw();
@@ -15025,10 +15091,10 @@ impl ApplicationHandler<HostEvent> for Host {
                 }
             }
             // A hover is due once the pointer has rested.
-            if let Some(rest) = state.hover_rest.as_ref().filter(|r| !r.asked) {
+            if let Some(rest) = state.hover_rest.as_ref().filter(|r| drawable && !r.asked) {
                 let due = rest.since + HOVER_DELAY;
                 if Instant::now() >= due {
-                    state.window.request_redraw();
+                    state.redraw.request();
                 } else {
                     wake_at = wake_at.min(due);
                 }
@@ -15044,13 +15110,34 @@ impl ApplicationHandler<HostEvent> for Host {
                     }
                 }
             }
-            if state.focused {
+            if state.focused && drawable {
                 if state.last_blink.elapsed() >= BLINK {
                     state.cursor_on = !state.cursor_on;
                     state.last_blink = Instant::now();
                     state.window.request_redraw();
                 }
                 wake_at = wake_at.min(state.last_blink + BLINK);
+            }
+            let now = Instant::now();
+            if let Some(at) = state.redraw.deadline(now, state.focused, drawable) {
+                if at <= now {
+                    state.window.request_redraw();
+                } else {
+                    wake_at = wake_at.min(at);
+                }
+            }
+            if let Some(pip) = &state.pip {
+                if let Some(at) = pip.redraw.deadline(
+                    now,
+                    pip.window.has_focus(),
+                    window_drawable(&pip.window, pip.occluded),
+                ) {
+                    if at <= now {
+                        pip.window.request_redraw();
+                    } else {
+                        wake_at = wake_at.min(at);
+                    }
+                }
             }
             event_loop.set_control_flow(ControlFlow::WaitUntil(wake_at));
         }
@@ -15073,7 +15160,25 @@ impl ApplicationHandler<HostEvent> for Host {
         {
             match event {
                 WindowEvent::CloseRequested => state.pip = None,
-                WindowEvent::Resized(_) => state.resize_pip(),
+                WindowEvent::Resized(_) => {
+                    state.resize_pip();
+                    if let Some(pip) = &state.pip {
+                        pip.window.request_redraw();
+                    }
+                }
+                WindowEvent::Occluded(occluded) => {
+                    if let Some(pip) = &mut state.pip {
+                        pip.occluded = occluded;
+                        if !occluded {
+                            pip.window.request_redraw();
+                        }
+                    }
+                }
+                WindowEvent::Focused(_) => {
+                    if let Some(pip) = &state.pip {
+                        pip.window.request_redraw();
+                    }
+                }
                 WindowEvent::RedrawRequested => state.render_pip(),
                 _ => {}
             }
@@ -15259,6 +15364,13 @@ impl ApplicationHandler<HostEvent> for Host {
                 state.focused = f;
                 if f {
                     state.follow_recent_alert();
+                }
+                state.window.request_redraw();
+            }
+            WindowEvent::Occluded(occluded) => {
+                state.occluded = occluded;
+                if !occluded {
+                    state.window.request_redraw();
                 }
             }
             WindowEvent::Resized(_) => {
