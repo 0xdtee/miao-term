@@ -23,9 +23,9 @@ expensive and not the differentiator; rendering and app features are the work.
 ## Update
 
 The bootstrap used `vt100` for the screen model; as of Phase 2 the app runs on
-`alacritty_terminal` (via `term-core::aterm`) and `vt100` has been removed.
+`alacritty_terminal` (via `mtty-core::aterm`) and `vt100` has been removed.
 
-Update: ADR 0030 added a second host, `miao-term-widget` (bin `miaotty-native`),
+Update: ADR 0030 added a second host, `mtty-widget` (bin `miaotty-native`),
 whose native `winit` + `wgpu` loop draws the grid directly; the terminal is no
 longer always routed through an egui `PaintCallback`, which now only serves the
 `eframe` host.

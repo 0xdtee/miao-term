@@ -11,13 +11,13 @@
 
 ## 决定
 
-**统一意图模型**(`crates/term-ui/src/launch.rs`)。`Intent` 为
+**统一意图模型**(`crates/mtty-ui/src/launch.rs`)。`Intent` 为
 `Activate | Quick | Focus(pane_id) | Run(command)`,从 argv 解析
 (`--quick`、`--focus <id>`、`ssh://…`、`x-man-page://…`、`miaotty://quick`、
 `miaotty://focus?pane=…`),并为跨实例 inbox 编码/解码
 (`quick`、`focus\t<id>`、`run\t<cmd>`)。往返有单测。
 
-**全局热键。** `crates/term-ui/src/hotkey.rs` 解析加速键(`cmd+shift+t`、
+**全局热键。** `crates/mtty-ui/src/hotkey.rs` 解析加速键(`cmd+shift+t`、
 `ctrl+alt+space`,与平台无关且各处可测),并在 macOS 与 Windows 上通过
 `global-hotkey`(MIT)注册;该依赖按目标平台声明,故 Linux CI 不会引入 X11/Wayland。
 处理器翻转标志并调用 `egui::Context::request_repaint`;应用每帧轮询并切换快速终端。
@@ -43,6 +43,6 @@ compositor 自身的绑定机制获得快速终端,而这本来也是他们绑�
 - 按 id 聚焦 pane、切换快速终端与运行命令都可从应用外部驱动,这正是编辑器/启动器集成所需。
   在已有窗口*内部*抓键(菜单加速键)与 Wayland 原生全局快捷键仍属后续。
 - Update:Wayland 原生全局快捷键已在 ADR 0026 落地(见附记);窗口内菜单加速键仍属后续。
-- Update:intent/转发 helper 已移入 `miao-term-ui::launch`,原生 host(`miaotty-native`)现在
+- Update:intent/转发 helper 已移入 `mtty-ui::launch`,原生 host(`miaotty-native`)现在
   也会解析 argv intent、通过同一 inbox 转发后续启动(经 MTP 唤醒运行中的实例),并在
   `⌘⇧T` 上实现快速终端临时标签;该 host 的"重新打开已关闭标签"改绑到 `⌘⇧Z`。

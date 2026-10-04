@@ -6,7 +6,7 @@
 
 ## 背景
 
-引擎(`miao-term-*`)要能被第三方嵌入,应用(`miaotty-app`)是它的第一个消费者。
+引擎(`mtty-*`)要能被第三方嵌入,应用(`miaotty-app`)是它的第一个消费者。
 我们依赖的 Rust 生态绝大多数是宽松许可,但有少数间接依赖带"二选一"的 copyleft
 *选项*(例如 `Apache-2.0 OR GPL-2.0-only`)。因此需要明确一个对外许可,以及依赖准入规则。
 
@@ -41,7 +41,7 @@
 | `LicenseRef-UFL-1.0` | `epaint_default_fonts` | egui 内置的 Ubuntu 字体。宽松,且该 crate 另有 `OFL-1.1` 与 `MIT OR Apache-2.0` 覆盖。 |
 | `Apache-2.0 WITH LLVM-exception` | `target-lexicon` | 该例外严格比 `Apache-2.0` 更宽松;它被拒是因为表达式不是清单里已有的裸 `Apache-2.0`。 |
 
-第四个是**真实的违规**:**`serialport`(miao-term-ui 的直接依赖)是 `MPL-2.0`** —— 弱 copyleft,
+第四个是**真实的违规**:**`serialport`(mtty-ui 的直接依赖)是 `MPL-2.0`** —— 弱 copyleft,
 本 ADR 明确排除。它从被引入那天起就被记录为 MIT,而这条错误声明被一路抄进 ADR 0037 与 manifest 注释,
 无人核对。
 
@@ -56,7 +56,7 @@
 **该漏洞被判定为不可达,据此接受。** RUSTSEC-2023-0071(Marvin Attack)是 `rsa` **解密**路径上的
 时序侧信道,且没有已修复的版本。mtty 只经由 `ssh-key` 触及 `rsa`,且只用于解析与重新编码私钥:
 工作区只调用 `PrivateKey::from_openssh` 与 `to_openssh`,别无其他,也不存在任何 `sign`、`verify`
-或 RSA 解密调用 —— `term-keys` 里唯一的 `decrypt` 是 PuTTY `.ppk` 自己的 AES-256-CBC。
+或 RSA 解密调用 —— `mtty-keys` 里唯一的 `decrypt` 是 PuTTY `.ppk` 自己的 AES-256-CBC。
 该 crate 被链接进二进制,但那个有漏洞的操作**不在本代码的任何调用路径上**。`deny.toml` 把这条推理
 连同日期与"升级 `ssh-key` 时重评"的提示一起记在例外旁边。
 

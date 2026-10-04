@@ -2,7 +2,7 @@
 
 mtty highlights code with two engines (ADR 0034, phase E3):
 
-- **tree-sitter grammars** — crates.io dependencies of `miao-term-editor`; each
+- **tree-sitter grammars** — crates.io dependencies of `mtty-editor`; each
   crate carries its own licence (MIT, Apache-2.0 or CC0-1.0, checked against
   ADR 0006).
 - **Sublime syntaxes through syntect** — for languages no built-in grammar
@@ -34,7 +34,7 @@ under ADR 0006. Each directory carries the upstream licence file and a
 `SOURCE.md` naming the upstream repository and commit. Syntaxes bat converted
 from TextMate grammars keep the upstream grammar's licence.
 
-`crates/term-editor/build.rs` compiles them with syntect's defaults into one
+`crates/mtty-editor/build.rs` compiles them with syntect's defaults into one
 embedded dump; every vendored file must compile under the pure-Rust regex
 engine. Left out: bat's VimHelp and hosts (their patterns need Oniguruma), and
 syntaxes for languages a built-in tree-sitter grammar already covers.

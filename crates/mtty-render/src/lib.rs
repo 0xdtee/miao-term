@@ -1,0 +1,1367 @@
+//! `mtty-render` — GPU glyph-grid renderer (wgpu + glyphon).
+//!
+//! The app builds row runs from the terminal screen and hands them here; this
+//! crate owns the font system, glyph atlas, and the glyphon text pipeline. It
+//! draws into the same `wgpu` device/queue/surface as egui.
+
+use std::borrow::Cow;
+use std::collections::HashMap;
+
+use glyphon::{
+    fontdb, Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping,
+    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
+};
+
+/// A run of same-colored text within a row, pinned to a starting cell column.
+///
+/// Runs may only contain single-cell characters; a wide (2-cell) character must
+/// be its own span so it can be positioned at an exact cell.
+pub struct Span {
+    pub col: u16,
+    pub text: String,
+    pub color: (u8, u8, u8),
+}
+
+impl Span {
+    pub fn new(col: u16, text: impl Into<String>, color: (u8, u8, u8)) -> Self {
+        Self {
+            col,
+            text: text.into(),
+            color,
+        }
+    }
+}
+
+/// Owns glyphon state for drawing a grid of text.
+pub struct TermRenderer {
+    font_system: FontSystem,
+    swash_cache: SwashCache,
+    #[allow(dead_code)]
+    cache: Cache,
+    atlas: TextAtlas,
+    renderer: TextRenderer,
+    viewport: Viewport,
+    buffers: HashMap<String, Buffer>,
+    layout: Option<(f32, f32, Option<String>)>,
+    /// Stand-ins for symbols the current font lacks (see `TEXT_SYMBOL_STANDINS`).
+    standins: Vec<(char, char)>,
+}
+
+/// Text-presentation emoji that macOS font fallback would otherwise draw from
+/// Apple Color Emoji, whose bitmaps ignore the cell colour (Claude Code's
+/// `⏺` marker loses its green/red status). The bundled JetBrains Mono carries
+/// monochrome glyphs for them (`scripts/merge-symbol-glyphs.py`); for any other
+/// font that lacks them, draw a common monochrome stand-in instead.
+const TEXT_SYMBOL_STANDINS: &[(char, char)] = &[
+    ('\u{23FA}', '\u{25CF}'), // ⏺ -> ●
+    ('\u{23F9}', '\u{25A0}'), // ⏹ -> ■
+    ('\u{23BF}', '\u{2514}'), // ⎿ -> └ (Claude Code's tool-result marker)
+    ('\u{2B05}', '\u{2190}'), // ⬅ -> ←
+    ('\u{2B06}', '\u{2191}'), // ⬆ -> ↑
+    ('\u{2B07}', '\u{2193}'), // ⬇ -> ↓
+];
+
+/// The stand-ins `family` needs: symbols its primary face lacks, replaced by
+/// characters it has.
+fn missing_standins(font_system: &mut FontSystem, family: Family) -> Vec<(char, char)> {
+    let query = fontdb::Query {
+        families: &[family],
+        ..Default::default()
+    };
+    let Some(font) = font_system
+        .db()
+        .query(&query)
+        .and_then(|id| font_system.get_font(id))
+    else {
+        return Vec::new();
+    };
+    let charmap = font.as_swash().charmap();
+    TEXT_SYMBOL_STANDINS
+        .iter()
+        .copied()
+        .filter(|&(symbol, standin)| charmap.map(symbol) == 0 && charmap.map(standin) != 0)
+        .collect()
+}
+
+/// Applies `standins` unless the symbol explicitly asks for emoji presentation
+/// (followed by VS16).
+fn with_standins<'a>(text: &'a str, standins: &[(char, char)]) -> Cow<'a, str> {
+    if standins.is_empty() || !text.chars().any(|c| standins.iter().any(|&(s, _)| s == c)) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        let emoji = chars.peek() == Some(&'\u{FE0F}');
+        match standins.iter().find(|&&(s, _)| s == c) {
+            Some(&(_, standin)) if !emoji => out.push(standin),
+            _ => out.push(c),
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Candidate system CJK fonts (macOS / Linux / Windows).
+const CJK_FONTS: &[&str] = &[
+    "/System/Library/Fonts/PingFang.ttc",
+    "/System/Library/Fonts/STHeiti Light.ttc",
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "C:/Windows/Fonts/msyh.ttc",
+    "C:/Windows/Fonts/simhei.ttf",
+];
+
+/// Fonts bundled with the app (embedded at compile time; see `assets/fonts/`).
+const BUNDLED_FONTS: &[&[u8]] = &[
+    include_bytes!("../../../assets/fonts/JetBrainsMono.ttf"),
+    include_bytes!("../../../assets/fonts/JetBrainsMono-Italic.ttf"),
+    include_bytes!("../../../assets/fonts/SymbolsNerdFontMono-Regular.ttf"),
+];
+
+/// Load the default monospace font plus the Nerd Font symbol fallback.
+fn load_bundled(font_system: &mut FontSystem) {
+    for bytes in BUNDLED_FONTS {
+        font_system.db_mut().load_font_data(bytes.to_vec());
+    }
+}
+
+/// Load a system CJK font into the font database so CJK glyphs render.
+fn load_system_cjk(font_system: &mut FontSystem) {
+    for path in CJK_FONTS {
+        if let Ok(bytes) = std::fs::read(path) {
+            font_system.db_mut().load_font_data(bytes);
+            return;
+        }
+    }
+}
+
+impl TermRenderer {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
+        let cache = Cache::new(device);
+        let mut atlas = TextAtlas::new(device, queue, &cache, format);
+        let renderer =
+            TextRenderer::new(&mut atlas, device, wgpu::MultisampleState::default(), None);
+        let viewport = Viewport::new(device, &cache);
+        let mut font_system = FontSystem::new();
+        load_bundled(&mut font_system);
+        load_system_cjk(&mut font_system);
+        // The bundled JetBrains Mono is the intended default. fontdb's own
+        // fallback is "Courier New", which lacks box-drawing (U+2503 `┃`, used
+        // by miao's message border) and other glyphs, so a missing glyph was
+        // rendered as a stray `z` on Windows.
+        font_system.db_mut().set_monospace_family("JetBrains Mono");
+        Self {
+            font_system,
+            swash_cache: SwashCache::new(),
+            cache,
+            atlas,
+            renderer,
+            viewport,
+            buffers: HashMap::new(),
+            layout: None,
+            standins: Vec::new(),
+        }
+    }
+
+    /// Prepare the glyphs for this frame.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pixels: (u32, u32),
+        scale: f32,
+        font_size: f32,
+        line_height: f32,
+        cell_width: f32,
+        left: f32,
+        top: f32,
+        _default_color: (u8, u8, u8),
+        family: Option<&str>,
+        rows: &[Vec<Span>],
+    ) {
+        self.viewport.update(
+            queue,
+            Resolution {
+                width: pixels.0.max(1),
+                height: pixels.1.max(1),
+            },
+        );
+
+        // glyphon's trim resets the previous frame's in-use set; it does not
+        // repack or shrink textures. Preparing the new frame promotes its own
+        // glyphs again, allowing older glyphs to be evicted instead of pinning
+        // hundreds of frames and forcing unnecessary atlas growth.
+        self.atlas.trim();
+
+        let metrics = Metrics::new(font_size, line_height);
+        let fam = match family {
+            Some(name) => Family::Name(name),
+            None => Family::Monospace,
+        };
+
+        // `left`/`top`/`line_height`/`cell_width` are logical points relative to
+        // the target viewport's origin; glyphon positions in *physical* pixels
+        // and already scales per-glyph advances by `scale`. `pixels` must be the
+        // viewport's pixel size (egui-wgpu sets the render viewport to the
+        // callback's rect), not the whole surface.
+        let left_px = left * scale;
+        let top_px = top * scale;
+        let line_px = line_height * scale;
+        let cell_px = cell_width * scale;
+        let bounds = TextBounds {
+            left: left_px as i32,
+            top: top_px as i32,
+            right: pixels.0 as i32,
+            bottom: pixels.1 as i32,
+        };
+
+        // Cache by text, not span index: scrolling and color/cursor changes
+        // must not invalidate shaping. Repeated CJK glyphs share one layout.
+        // Color belongs to TextArea, so it never becomes part of the cache key.
+        let layout = (font_size, line_height, family.map(str::to_owned));
+        if self.layout.as_ref() != Some(&layout) {
+            self.buffers.clear();
+            self.layout = Some(layout);
+            self.standins = missing_standins(&mut self.font_system, fam);
+        }
+        for span in rows.iter().flatten() {
+            if !self.buffers.contains_key(&span.text) {
+                let mut buffer = Buffer::new(&mut self.font_system, metrics);
+                buffer.set_size(&mut self.font_system, None, None);
+                // Advanced shaping retains fallback for CJK and symbols.
+                buffer.set_text(
+                    &mut self.font_system,
+                    &with_standins(&span.text, &self.standins),
+                    Attrs::new().family(fam),
+                    Shaping::Advanced,
+                );
+                buffer.shape_until_scroll(&mut self.font_system, false);
+                self.buffers.insert(span.text.clone(), buffer);
+            }
+        }
+        // Only the visible frame is retained. Streaming output cannot grow
+        // this cache indefinitely; keep its allocation bounded after a resize.
+        let visible: std::collections::HashSet<&str> = rows
+            .iter()
+            .flatten()
+            .map(|span| span.text.as_str())
+            .collect();
+        self.buffers
+            .retain(|text, _| visible.contains(text.as_str()));
+        if self.buffers.capacity() > self.buffers.len().max(64) * 4 {
+            self.buffers.shrink_to(self.buffers.len().max(64) * 2);
+        }
+
+        let buffers = &self.buffers;
+        let areas: Vec<TextArea> = rows
+            .iter()
+            .enumerate()
+            .flat_map(|(row_idx, row)| {
+                row.iter().map(move |span| TextArea {
+                    buffer: &buffers[&span.text],
+                    left: left_px + span.col as f32 * cell_px,
+                    top: top_px + row_idx as f32 * line_px,
+                    scale,
+                    bounds,
+                    default_color: Color::rgb(span.color.0, span.color.1, span.color.2),
+                    custom_glyphs: &[],
+                })
+            })
+            .collect();
+
+        if let Err(e) = self.renderer.prepare(
+            device,
+            queue,
+            &mut self.font_system,
+            &mut self.atlas,
+            &self.viewport,
+            areas,
+            &mut self.swash_cache,
+        ) {
+            eprintln!("mtty: text prepare error: {e}");
+        }
+    }
+
+    /// Draw prepared glyphs into the pass.
+    pub fn render(&self, pass: &mut wgpu::RenderPass<'_>) {
+        if let Err(e) = self.renderer.render(&self.atlas, &self.viewport, pass) {
+            eprintln!("mtty: text render error: {e}");
+        }
+    }
+}
+
+/// Measures the cell size from the actual font, so grid layout matches the
+/// glyphs the renderer draws.
+pub struct MetricsProbe {
+    font_system: FontSystem,
+    buffer: Buffer,
+}
+
+impl Default for MetricsProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MetricsProbe {
+    pub fn new() -> Self {
+        let mut font_system = FontSystem::new();
+        load_bundled(&mut font_system);
+        load_system_cjk(&mut font_system);
+        let buffer = Buffer::new(&mut font_system, Metrics::new(14.0, 18.0));
+        Self {
+            font_system,
+            buffer,
+        }
+    }
+
+    /// Returns `(cell_width, line_height)` for the given font size.
+    pub fn cell(&mut self, font_size: f32, line_height: f32, family: Option<&str>) -> (f32, f32) {
+        let metrics = Metrics::new(font_size, line_height);
+        let fam = match family {
+            Some(name) => Family::Name(name),
+            None => Family::Monospace,
+        };
+        self.buffer.set_metrics(&mut self.font_system, metrics);
+        self.buffer.set_size(&mut self.font_system, None, None);
+        self.buffer.set_text(
+            &mut self.font_system,
+            "M",
+            Attrs::new().family(fam),
+            Shaping::Basic,
+        );
+        self.buffer.shape_until_scroll(&mut self.font_system, false);
+        let mut width = font_size * 0.6;
+        for run in self.buffer.layout_runs() {
+            if run.line_w > 0.0 {
+                width = run.line_w;
+                break;
+            }
+        }
+        (width, line_height)
+    }
+}
+
+/// A solid-colour rectangle in physical pixels (background / selection / cursor).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Quad {
+    pub min: [f32; 2],
+    pub max: [f32; 2],
+    pub color: [f32; 4],
+    /// Corner radius in physical pixels (0 = square).
+    pub radius: f32,
+}
+
+impl Quad {
+    pub fn new(min: (f32, f32), max: (f32, f32), color: (u8, u8, u8, u8)) -> Self {
+        Self {
+            min: [min.0, min.1],
+            max: [max.0, max.1],
+            color: [
+                color.0 as f32 / 255.0,
+                color.1 as f32 / 255.0,
+                color.2 as f32 / 255.0,
+                color.3 as f32 / 255.0,
+            ],
+            radius: 0.0,
+        }
+    }
+
+    pub fn rounded(min: (f32, f32), max: (f32, f32), color: (u8, u8, u8, u8), radius: f32) -> Self {
+        let mut q = Self::new(min, max, color);
+        q.radius = radius;
+        q
+    }
+}
+
+const QUAD_WGSL: &str = r#"
+struct Globals { resolution: vec2<f32>, _pad: vec2<f32> };
+@group(0) @binding(0) var<uniform> globals: Globals;
+
+struct VsIn {
+    @location(0) min: vec2<f32>,
+    @location(1) max: vec2<f32>,
+    @location(2) color: vec4<f32>,
+    @location(3) radius: f32,
+    @builtin(vertex_index) vi: u32,
+};
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) color: vec4<f32>,
+    @location(1) rect_min: vec2<f32>,
+    @location(2) rect_max: vec2<f32>,
+    @location(3) radius: f32,
+};
+
+@vertex
+fn vs(in: VsIn) -> VsOut {
+    var corners = array<vec2<f32>, 6>(
+        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
+        vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0),
+    );
+    let c = corners[in.vi];
+    let p = mix(in.min, in.max, c);
+    let ndc = vec2<f32>(
+        p.x / globals.resolution.x * 2.0 - 1.0,
+        p.y / globals.resolution.y * 2.0 - 1.0,
+    );
+    var o: VsOut;
+    o.pos = vec4<f32>(ndc.x, -ndc.y, 0.0, 1.0);
+    o.color = in.color;
+    o.rect_min = in.min;
+    o.rect_max = in.max;
+    o.radius = in.radius;
+    return o;
+}
+
+fn to_linear(c: vec3<f32>) -> vec3<f32> {
+    let lo = c / 12.92;
+    let hi = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+    return select(hi, lo, c <= vec3<f32>(0.04045));
+}
+
+@fragment
+fn fs(in: VsOut) -> @location(0) vec4<f32> {
+    var alpha = in.color.a;
+    if (in.radius > 0.5) {
+        let center = (in.rect_min + in.rect_max) * 0.5;
+        let half = (in.rect_max - in.rect_min) * 0.5;
+        let b = max(half - vec2<f32>(in.radius), vec2<f32>(0.0));
+        let q = abs(in.pos.xy - center) - b;
+        let d = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - in.radius;
+        alpha = in.color.a * (1.0 - smoothstep(-1.0, 1.0, d));
+    }
+    return vec4<f32>(to_linear(in.color.rgb), alpha);
+}
+"#;
+
+/// Instanced renderer for solid-colour quads, drawn beneath the glyphs.
+pub struct QuadRenderer {
+    pipeline: wgpu::RenderPipeline,
+    globals: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    instances: wgpu::Buffer,
+    capacity: usize,
+    count: u32,
+}
+
+impl QuadRenderer {
+    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("quad shader"),
+            source: wgpu::ShaderSource::Wgsl(QUAD_WGSL.into()),
+        });
+        let globals = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("quad globals"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: globals.as_entire_binding(),
+            }],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("quad pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Quad>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![
+                        0 => Float32x2, 1 => Float32x2, 2 => Float32x4, 3 => Float32
+                    ],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        let capacity = 4096;
+        let instances = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("quad instances"),
+            size: (capacity * std::mem::size_of::<Quad>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Self {
+            pipeline,
+            globals,
+            bind_group,
+            instances,
+            capacity,
+            count: 0,
+        }
+    }
+
+    /// Upload this frame's quads. `resolution` is the surface size in pixels.
+    pub fn prepare(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        resolution: (u32, u32),
+        quads: &[Quad],
+    ) {
+        queue.write_buffer(
+            &self.globals,
+            0,
+            bytemuck_cast(&[resolution.0 as f32, resolution.1 as f32, 0.0, 0.0]),
+        );
+        if quads.len() > self.capacity {
+            self.capacity = quads.len().next_power_of_two();
+            self.instances = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("quad instances"),
+                size: (self.capacity * std::mem::size_of::<Quad>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if !quads.is_empty() {
+            queue.write_buffer(&self.instances, 0, bytemuck_cast(quads));
+        }
+        self.count = quads.len() as u32;
+    }
+
+    pub fn render(&self, pass: &mut wgpu::RenderPass<'_>) {
+        if self.count == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.set_vertex_buffer(0, self.instances.slice(..));
+        pass.draw(0..6, 0..self.count);
+    }
+}
+
+/// One textured quad, in physical pixels, with UVs in [0,1].
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct ImageInstance {
+    pub min: [f32; 2],
+    pub max: [f32; 2],
+    pub uv_min: [f32; 2],
+    pub uv_max: [f32; 2],
+}
+
+const IMAGE_WGSL: &str = r#"
+struct Globals { resolution: vec2<f32>, _pad: vec2<f32> };
+@group(0) @binding(0) var<uniform> globals: Globals;
+@group(1) @binding(0) var tex: texture_2d<f32>;
+@group(1) @binding(1) var samp: sampler;
+
+struct VsIn {
+    @location(0) min: vec2<f32>,
+    @location(1) max: vec2<f32>,
+    @location(2) uv_min: vec2<f32>,
+    @location(3) uv_max: vec2<f32>,
+    @builtin(vertex_index) vi: u32,
+};
+struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+
+@vertex
+fn vs(in: VsIn) -> VsOut {
+    var corners = array<vec2<f32>, 6>(
+        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
+        vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0),
+    );
+    let c = corners[in.vi];
+    let p = mix(in.min, in.max, c);
+    let ndc = vec2<f32>(
+        p.x / globals.resolution.x * 2.0 - 1.0,
+        p.y / globals.resolution.y * 2.0 - 1.0,
+    );
+    var o: VsOut;
+    o.pos = vec4<f32>(ndc.x, -ndc.y, 0.0, 1.0);
+    o.uv = mix(in.uv_min, in.uv_max, c);
+    return o;
+}
+
+@fragment
+fn fs(in: VsOut) -> @location(0) vec4<f32> {
+    return textureSample(tex, samp, in.uv);
+}
+"#;
+
+/// Instanced renderer for inline images (one texture per image). Quads are
+/// grouped by texture so each image is one draw call over an instance range.
+pub struct ImageRenderer {
+    pipeline: wgpu::RenderPipeline,
+    globals: wgpu::Buffer,
+    globals_bg: wgpu::BindGroup,
+    texture_bgl: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    textures: std::collections::HashMap<u64, wgpu::BindGroup>,
+    instances: wgpu::Buffer,
+    capacity: usize,
+    /// (pane, texture key, instance start, instance count)
+    runs: Vec<(u32, u64, u32, u32)>,
+}
+
+impl ImageRenderer {
+    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("image shader"),
+            source: wgpu::ShaderSource::Wgsl(IMAGE_WGSL.into()),
+        });
+        let globals = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("image globals"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let globals_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let globals_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &globals_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: globals.as_entire_binding(),
+            }],
+        });
+        let texture_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("image sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[&globals_bgl, &texture_bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("image pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<ImageInstance>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![
+                        0 => Float32x2, 1 => Float32x2, 2 => Float32x2, 3 => Float32x2
+                    ],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        let capacity = 64;
+        let instances = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("image instances"),
+            size: (capacity * std::mem::size_of::<ImageInstance>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Self {
+            pipeline,
+            globals,
+            globals_bg,
+            texture_bgl,
+            sampler,
+            textures: std::collections::HashMap::new(),
+            instances,
+            capacity,
+            runs: Vec::new(),
+        }
+    }
+
+    pub fn has(&self, id: u64) -> bool {
+        self.textures.contains_key(&id)
+    }
+
+    /// Create (or replace) the texture for `id`.
+    pub fn upload(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        id: u64,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) {
+        if width == 0 || height == 0 || rgba.len() < (width * height * 4) as usize {
+            return;
+        }
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("inline image"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            texture.as_image_copy(),
+            rgba,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.texture_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        self.textures.insert(id, bind_group);
+    }
+
+    pub fn remove(&mut self, id: u64) {
+        self.textures.remove(&id);
+    }
+
+    /// Drop textures whose ids are not in `keep`.
+    pub fn retain(&mut self, keep: &std::collections::HashSet<u64>) {
+        self.textures.retain(|id, _| keep.contains(id));
+    }
+
+    /// Upload this frame's image quads (grouped by texture id).
+    pub fn prepare(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        resolution: (u32, u32),
+        quads: &[(u64, i32, u32, ImageInstance)],
+    ) {
+        queue.write_buffer(
+            &self.globals,
+            0,
+            bytemuck_cast(&[resolution.0 as f32, resolution.1 as f32, 0.0, 0.0]),
+        );
+        let mut sorted: Vec<(u64, i32, u32, ImageInstance)> = quads.to_vec();
+        // Group by pane (so a pane can be drawn alone), then lower z first.
+        sorted.sort_by(|a, b| a.2.cmp(&b.2).then(a.1.cmp(&b.1)).then(a.0.cmp(&b.0)));
+        self.runs.clear();
+        let mut start = 0usize;
+        for i in 1..=sorted.len() {
+            if i == sorted.len() || (sorted[i].0, sorted[i].2) != (sorted[start].0, sorted[start].2)
+            {
+                self.runs.push((
+                    sorted[start].2,
+                    sorted[start].0,
+                    start as u32,
+                    (i - start) as u32,
+                ));
+                start = i;
+            }
+        }
+        if sorted.len() > self.capacity {
+            self.capacity = sorted.len().next_power_of_two();
+            self.instances = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("image instances"),
+                size: (self.capacity * std::mem::size_of::<ImageInstance>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        let instances: Vec<ImageInstance> = sorted.iter().map(|(_, _, _, q)| *q).collect();
+        if !instances.is_empty() {
+            queue.write_buffer(&self.instances, 0, bytemuck_cast(&instances));
+        }
+    }
+
+    /// Draw one pane's images (its runs are contiguous after `prepare`).
+    pub fn render(&self, pass: &mut wgpu::RenderPass<'_>, pane: u32) {
+        self.draw(pass, Some(pane));
+    }
+
+    /// Draw every image (used by the offscreen capture).
+    pub fn render_all(&self, pass: &mut wgpu::RenderPass<'_>) {
+        self.draw(pass, None);
+    }
+
+    fn draw(&self, pass: &mut wgpu::RenderPass<'_>, only: Option<u32>) {
+        if self.runs.is_empty() {
+            return;
+        }
+        let mut set = false;
+        for (pane, id, start, count) in &self.runs {
+            if only.is_some_and(|p| p != *pane) {
+                continue;
+            }
+            if let Some(bg) = self.textures.get(id) {
+                if !set {
+                    pass.set_pipeline(&self.pipeline);
+                    pass.set_bind_group(0, &self.globals_bg, &[]);
+                    pass.set_vertex_buffer(0, self.instances.slice(..));
+                    set = true;
+                }
+                pass.set_bind_group(1, bg, &[]);
+                pass.draw(0..6, *start..*start + *count);
+            }
+        }
+    }
+}
+
+/// Reinterpret a slice of `#[repr(C)]` plain-old-data as bytes (no bytemuck dep).
+fn bytemuck_cast<T: Copy>(data: &[T]) -> &[u8] {
+    // SAFETY: `T` is `#[repr(C)]`/POD here (f32 / Quad of f32) with no padding
+    // bits that matter, so viewing it as bytes is sound.
+    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) }
+}
+
+/// Renderer crate version.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[cfg(test)]
+mod symbol_tests {
+    use super::*;
+
+    #[test]
+    fn bundled_font_draws_text_symbols_itself() {
+        let mut font_system =
+            FontSystem::new_with_locale_and_db("en-US".into(), Default::default());
+        load_bundled(&mut font_system);
+        let standins = missing_standins(&mut font_system, Family::Name("JetBrains Mono"));
+        // Every bundled text symbol is present except U+23BF, which miao's
+        // tool-result marker uses and `TEXT_SYMBOL_STANDINS` maps to `└`.
+        assert_eq!(
+            standins,
+            vec![('\u{23BF}', '\u{2514}')],
+            "unexpected stand-ins: {standins:?}"
+        );
+    }
+
+    #[test]
+    fn standins_keep_explicit_emoji_presentation() {
+        let standins = [('\u{23FA}', '\u{25CF}')];
+        assert_eq!(with_standins("\u{23FA} Bash", &standins), "\u{25CF} Bash");
+        assert_eq!(
+            with_standins("\u{23FA}\u{FE0F}", &standins),
+            "\u{23FA}\u{FE0F}"
+        );
+        assert!(matches!(
+            with_standins("plain", &standins),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(with_standins("\u{23FA}", &[]), Cow::Borrowed(_)));
+    }
+}
+
+#[cfg(test)]
+mod gpu_tests {
+    use super::*;
+
+    fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
+        gpu_with_limits(wgpu::Limits::default())
+    }
+
+    fn gpu_with_limits(limits: wgpu::Limits) -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+        let Some(adapter) =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+        else {
+            assert!(
+                std::env::var_os("MIAO_REQUIRE_GPU").is_none(),
+                "MIAO_REQUIRE_GPU is set but no wgpu adapter is available"
+            );
+            return None;
+        };
+        let Ok((device, queue)) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                required_limits: limits,
+                ..Default::default()
+            },
+            None,
+        )) else {
+            assert!(
+                std::env::var_os("MIAO_REQUIRE_GPU").is_none(),
+                "MIAO_REQUIRE_GPU is set but no wgpu device could be created"
+            );
+            return None;
+        };
+
+        Some((device, queue))
+    }
+
+    /// A small atlas must recycle glyphs between frames rather than needing to
+    /// grow to hold the union of a long stream. Compare actual pixels against
+    /// an explicitly trimmed reference, so stale/missing glyphs also fail.
+    #[test]
+    fn streaming_frames_recycle_atlas_space() {
+        let Some((device, queue)) = gpu_with_limits(wgpu::Limits {
+            max_texture_dimension_2d: 256,
+            ..Default::default()
+        }) else {
+            return;
+        };
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut stream = TermRenderer::new(&device, &queue, format);
+        let mut reference = TermRenderer::new(&device, &queue, format);
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("atlas lifetime regression"),
+            size: wgpu::Extent3d {
+                width: 256,
+                height: 128,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("atlas lifetime readback"),
+            size: 256 * 128 * 4,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        for letter in b'A'..=b'Z' {
+            let rows = [vec![Span::new(
+                0,
+                char::from(letter).to_string(),
+                (255, 255, 255),
+            )]];
+            reference.atlas.trim();
+            for (renderer, left) in [(&mut stream, 0.0), (&mut reference, 128.0)] {
+                renderer.prepare(
+                    &device,
+                    &queue,
+                    (256, 128),
+                    1.0,
+                    120.0,
+                    128.0,
+                    72.0,
+                    left,
+                    0.0,
+                    (255, 255, 255),
+                    Some("JetBrains Mono"),
+                    &rows,
+                );
+            }
+            let mut encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            {
+                let mut pass = encoder
+                    .begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: None,
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        occlusion_query_set: None,
+                        timestamp_writes: None,
+                    })
+                    .forget_lifetime();
+                stream.render(&mut pass);
+                reference.render(&mut pass);
+            }
+            encoder.copy_texture_to_buffer(
+                wgpu::ImageCopyTexture {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyBuffer {
+                    buffer: &readback,
+                    layout: wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(1024),
+                        rows_per_image: Some(128),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: 256,
+                    height: 128,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit(Some(encoder.finish()));
+            let slice = readback.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                tx.send(result).unwrap();
+            });
+            device.poll(wgpu::Maintain::Wait);
+            rx.recv().unwrap().unwrap();
+            let pixels = slice.get_mapped_range();
+            assert!(
+                pixels
+                    .chunks_exact(1024)
+                    .all(|row| row[..512] == row[512..]),
+                "streaming atlas produced stale or missing glyph {}",
+                char::from(letter)
+            );
+            assert!(
+                pixels.chunks_exact(1024).any(|row| row[..512]
+                    .chunks_exact(4)
+                    .any(|pixel| pixel[..3].iter().any(|&channel| channel > 0))),
+                "glyph {} was not rendered",
+                char::from(letter)
+            );
+            drop(pixels);
+            readback.unmap();
+        }
+    }
+
+    #[test]
+    #[ignore = "release GPU performance gate"]
+    fn unchanged_grid_reuses_shaping() {
+        let Some((device, queue)) = gpu() else {
+            return;
+        };
+        let mut renderer = TermRenderer::new(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let mut rows: Vec<Vec<Span>> = (0..50)
+            .map(|row| {
+                let mut spans = vec![Span::new(
+                    0,
+                    format!("row {row:02}: terminal streaming output"),
+                    (255, 255, 255),
+                )];
+                for col in (40..100).step_by(2) {
+                    spans.push(Span::new(col, "中", (180, 200, 220)));
+                }
+                spans
+            })
+            .collect();
+        let prepare = |renderer: &mut TermRenderer, rows: &[Vec<Span>], size| {
+            renderer.prepare(
+                &device,
+                &queue,
+                (1200, 1000),
+                1.0,
+                size,
+                20.0,
+                10.0,
+                0.0,
+                0.0,
+                (255, 255, 255),
+                Some("JetBrains Mono"),
+                rows,
+            );
+        };
+        prepare(&mut renderer, &rows, 14.0);
+        assert_eq!(
+            renderer.buffers.len(),
+            51,
+            "duplicate CJK spans must share layout"
+        );
+        let glyphs = renderer.buffers["中"].lines[0]
+            .layout_opt()
+            .as_ref()
+            .unwrap()
+            .as_ptr();
+        // Moving and recoloring a span should reuse its actual glyph layout.
+        rows[0][1].col += 2;
+        rows[0][1].color = (255, 0, 0);
+        prepare(&mut renderer, &rows, 14.0);
+        assert_eq!(
+            renderer.buffers["中"].lines[0]
+                .layout_opt()
+                .as_ref()
+                .unwrap()
+                .as_ptr(),
+            glyphs
+        );
+
+        let start = std::time::Instant::now();
+        for _ in 0..30 {
+            prepare(&mut renderer, &rows, 14.0);
+        }
+        let cached = start.elapsed();
+        let start = std::time::Instant::now();
+        for _ in 0..30 {
+            renderer.buffers.clear();
+            prepare(&mut renderer, &rows, 14.0);
+        }
+        let cold = start.elapsed();
+        eprintln!("grid prepare: cached={cached:?}, forced reshaping={cold:?}");
+        assert!(cached < cold, "cache must reduce preparation time");
+        // Streaming unique strings and changing font metrics must release old layouts.
+        for i in 0..100 {
+            prepare(
+                &mut renderer,
+                &[vec![Span::new(0, format!("stream {i}"), (255, 255, 255))]],
+                16.0,
+            );
+            assert_eq!(renderer.buffers.len(), 1);
+        }
+        assert!(renderer.buffers.capacity() <= 256);
+        assert_eq!(
+            renderer
+                .buffers
+                .values()
+                .next()
+                .unwrap()
+                .metrics()
+                .font_size,
+            16.0
+        );
+    }
+
+    /// Headless smoke test: render a quad + a glyph row offscreen and assert the
+    /// pipeline produces output. Skips itself when no GPU adapter is available
+    /// (e.g. a CI runner without a driver), so it is safe to run in CI.
+    #[test]
+    fn offscreen_render_smoke() {
+        let Some((device, queue)) = gpu() else {
+            return;
+        };
+
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let (w, h) = (64u32, 40u32);
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut quads = QuadRenderer::new(&device, format);
+        quads.prepare(
+            &device,
+            &queue,
+            (w, h),
+            &[Quad::rounded(
+                (2.0, 2.0),
+                (30.0, 20.0),
+                (0xff, 0xff, 0xff, 255),
+                4.0,
+            )],
+        );
+        let mut glyphs = TermRenderer::new(&device, &queue, format);
+        let rows = vec![vec![Span::new(0, "Hi", (255, 255, 255))]];
+        glyphs.prepare(
+            &device,
+            &queue,
+            (w, h),
+            1.0,
+            12.0,
+            14.0,
+            7.0,
+            0.0,
+            0.0,
+            (255, 255, 255),
+            Some("JetBrains Mono"),
+            &rows,
+        );
+        // Inline image (exercises the texture pipeline).
+        let mut images = ImageRenderer::new(&device, format);
+        images.upload(
+            &device,
+            &queue,
+            1,
+            2,
+            2,
+            &[
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
+            ],
+        );
+        images.prepare(
+            &device,
+            &queue,
+            (w, h),
+            &[(
+                1,
+                0,
+                0,
+                ImageInstance {
+                    min: [36.0, 2.0],
+                    max: [60.0, 20.0],
+                    uv_min: [0.0, 0.0],
+                    uv_max: [1.0, 1.0],
+                },
+            )],
+        );
+
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut pass = enc
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                })
+                .forget_lifetime();
+            quads.render(&mut pass);
+            glyphs.render(&mut pass);
+            images.render(&mut pass, 0);
+        }
+        let bpr = (w * 4) as usize;
+        let padded = (bpr + 255) & !255;
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (padded * h as usize) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        enc.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &buf,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded as u32),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(enc.finish()));
+        let slice = buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::Maintain::Wait);
+        let data = slice.get_mapped_range();
+        assert!(data.iter().any(|&b| b > 0), "renderer produced no output");
+        // Diagnostic: sample the image rect (36..60 x 2..20) and the quad (2..30 x 2..20).
+        let px = |x: usize, y: usize| -> (u8, u8, u8) {
+            let o = y * padded + x * 4;
+            (data[o], data[o + 1], data[o + 2])
+        };
+        // The image quad (36..60 x 2..20) must actually paint: sample near its
+        // top-left texel (red) and just outside it (still the white quad).
+        let (r, g, b) = px(38, 4);
+        assert!(r > g && r > b, "image did not paint red: {r},{g},{b}");
+        let (qr, qg, qb) = px(10, 10);
+        assert!(
+            qr > 200 && qg > 200 && qb > 200,
+            "quad lost: {qr},{qg},{qb}"
+        );
+    }
+}
