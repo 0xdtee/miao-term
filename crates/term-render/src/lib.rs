@@ -45,7 +45,6 @@ pub struct TermRenderer {
     layout: Option<(f32, f32, Option<String>)>,
     /// Stand-ins for symbols the current font lacks (see `TEXT_SYMBOL_STANDINS`).
     standins: Vec<(char, char)>,
-    frames: u64,
 }
 
 /// Text-presentation emoji that macOS font fallback would otherwise draw from
@@ -162,7 +161,6 @@ impl TermRenderer {
             buffers: HashMap::new(),
             layout: None,
             standins: Vec::new(),
-            frames: 0,
         }
     }
 
@@ -191,11 +189,11 @@ impl TermRenderer {
             },
         );
 
-        // Periodically repack the glyph atlas to reclaim space from old glyphs.
-        self.frames = self.frames.wrapping_add(1);
-        if self.frames % 300 == 0 {
-            self.atlas.trim();
-        }
+        // glyphon's trim resets the previous frame's in-use set; it does not
+        // repack or shrink textures. Preparing the new frame promotes its own
+        // glyphs again, allowing older glyphs to be evicted instead of pinning
+        // hundreds of frames and forcing unnecessary atlas growth.
+        self.atlas.trim();
 
         let metrics = Metrics::new(font_size, line_height);
         let fam = match family {
@@ -955,6 +953,10 @@ mod gpu_tests {
     use super::*;
 
     fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
+        gpu_with_limits(wgpu::Limits::default())
+    }
+
+    fn gpu_with_limits(limits: wgpu::Limits) -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let Some(adapter) =
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
@@ -965,9 +967,13 @@ mod gpu_tests {
             );
             return None;
         };
-        let Ok((device, queue)) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
-        else {
+        let Ok((device, queue)) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                required_limits: limits,
+                ..Default::default()
+            },
+            None,
+        )) else {
             assert!(
                 std::env::var_os("MIAO_REQUIRE_GPU").is_none(),
                 "MIAO_REQUIRE_GPU is set but no wgpu device could be created"
@@ -976,6 +982,135 @@ mod gpu_tests {
         };
 
         Some((device, queue))
+    }
+
+    /// A small atlas must recycle glyphs between frames rather than needing to
+    /// grow to hold the union of a long stream. Compare actual pixels against
+    /// an explicitly trimmed reference, so stale/missing glyphs also fail.
+    #[test]
+    fn streaming_frames_recycle_atlas_space() {
+        let Some((device, queue)) = gpu_with_limits(wgpu::Limits {
+            max_texture_dimension_2d: 256,
+            ..Default::default()
+        }) else {
+            return;
+        };
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut stream = TermRenderer::new(&device, &queue, format);
+        let mut reference = TermRenderer::new(&device, &queue, format);
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("atlas lifetime regression"),
+            size: wgpu::Extent3d {
+                width: 256,
+                height: 128,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("atlas lifetime readback"),
+            size: 256 * 128 * 4,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        for letter in b'A'..=b'Z' {
+            let rows = [vec![Span::new(
+                0,
+                char::from(letter).to_string(),
+                (255, 255, 255),
+            )]];
+            reference.atlas.trim();
+            for (renderer, left) in [(&mut stream, 0.0), (&mut reference, 128.0)] {
+                renderer.prepare(
+                    &device,
+                    &queue,
+                    (256, 128),
+                    1.0,
+                    120.0,
+                    128.0,
+                    72.0,
+                    left,
+                    0.0,
+                    (255, 255, 255),
+                    Some("JetBrains Mono"),
+                    &rows,
+                );
+            }
+            let mut encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            {
+                let mut pass = encoder
+                    .begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: None,
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        occlusion_query_set: None,
+                        timestamp_writes: None,
+                    })
+                    .forget_lifetime();
+                stream.render(&mut pass);
+                reference.render(&mut pass);
+            }
+            encoder.copy_texture_to_buffer(
+                wgpu::ImageCopyTexture {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyBuffer {
+                    buffer: &readback,
+                    layout: wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(1024),
+                        rows_per_image: Some(128),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: 256,
+                    height: 128,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit(Some(encoder.finish()));
+            let slice = readback.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                tx.send(result).unwrap();
+            });
+            device.poll(wgpu::Maintain::Wait);
+            rx.recv().unwrap().unwrap();
+            let pixels = slice.get_mapped_range();
+            assert!(
+                pixels
+                    .chunks_exact(1024)
+                    .all(|row| row[..512] == row[512..]),
+                "streaming atlas produced stale or missing glyph {}",
+                char::from(letter)
+            );
+            assert!(
+                pixels.chunks_exact(1024).any(|row| row[..512]
+                    .chunks_exact(4)
+                    .any(|pixel| pixel[..3].iter().any(|&channel| channel > 0))),
+                "glyph {} was not rendered",
+                char::from(letter)
+            );
+            drop(pixels);
+            readback.unmap();
+        }
     }
 
     #[test]
