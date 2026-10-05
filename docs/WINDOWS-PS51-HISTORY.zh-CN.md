@@ -13,14 +13,16 @@ ssh 会话落在 session 0，`[Environment]::UserInteractive` 为 `False`，
 
 1. 取得 v0.1.6 应用。从发布页下载 `mtty-windows-x86_64.zip` 并解压
    （内含 `mtty.exe`、`mtty-cli.exe`、`mtty-ptyhost.exe`）。
-2. 在普通桌面 PowerShell 窗口中运行：
+2. 先保存工作并关闭所有已运行的 mtty 窗口。Windows MTP 使用固定命名管道，
+   已运行实例会使目录隔离失效；脚本检测到已有实例时会拒绝运行。
+3. 在普通桌面 PowerShell 窗口中运行：
 
    ```powershell
    powershell -NoProfile -ExecutionPolicy Bypass `
      -File ps51-history-acceptance.ps1 -App <mtty.exe 的路径>
    ```
 
-3. 脚本以隔离状态启动 mtty，窗格 shell 设为 **Windows PowerShell 5.1**，
+4. 脚本以隔离状态启动 mtty，窗格 shell 设为 **Windows PowerShell 5.1**，
    经 shell 集成向窗格键入两条带标记的命令，并经 MTP 读回已记录的历史。
    它会打印 `PASS`/`FAIL`，并在运行目录旁写出 `history.json` 与 `output.txt`。
 

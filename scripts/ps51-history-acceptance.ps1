@@ -25,6 +25,12 @@ if (-not [Environment]::UserInteractive) {
     throw "Not an interactive session. Run this from the Windows desktop (RDP or the console), not over ssh."
 }
 
+# Windows MTP uses a fixed named pipe: XDG_RUNTIME_DIR does not isolate it.
+# Refuse to touch an existing instance's panes or history.
+if (Get-Process -Name mtty,miaotty -ErrorAction SilentlyContinue) {
+    throw "Close all existing mtty windows before running this acceptance check. Windows MTP uses a shared named pipe."
+}
+
 # Use Windows PowerShell 5.1 as the pane shell, so MTTY's 5.1 history hook is exercised.
 $ps51 = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
 if (-not (Test-Path $ps51)) { throw "Windows PowerShell 5.1 not found at $ps51" }
@@ -44,6 +50,8 @@ $env:XDG_DATA_HOME = Join-Path $base 'data'
 $env:XDG_RUNTIME_DIR = Join-Path $base 'runtime'
 $env:TMP = Join-Path $base 'tmp'
 $env:TEMP = Join-Path $base 'tmp'
+# Windows chooses COMSPEC, not SHELL (which is used on Unix).
+$env:COMSPEC = $ps51
 $env:SHELL = $ps51
 
 $sock = Join-Path $base 'runtime\mtty.sock'
@@ -52,30 +60,49 @@ Write-Host "Launching mtty in an isolated state..."
 
 $p = Start-Process -FilePath $app -PassThru
 try {
-    function Cli { param([string[]] $a) & $cli --socket $sock --wait 20 @a 2>&1 | Out-String }
+    # `cli` is a built-in alias for Clear-Item in Windows PowerShell 5.1.
+    function Invoke-MttyCli {
+        param([string[]] $Arguments)
+        $text = & $cli --socket $sock --wait 2 @Arguments | Out-String
+        if ($LASTEXITCODE -ne 0) { throw "mtty-cli failed ($LASTEXITCODE): $text" }
+        $text
+    }
 
     # Wait for the pane to exist.
     $ready = $false
     for ($i = 0; $i -lt 40; $i++) {
-        if ((Cli @('pane','list')) -match 'pane0') { $ready = $true; break }
+        $p.Refresh()
+        if ($p.HasExited) { throw "mtty exited before exposing its pane; check for an existing instance." }
+        try {
+            $panes = Invoke-MttyCli -Arguments @('pane','list') | ConvertFrom-Json
+            if (@($panes.panes | Where-Object { $_.id -eq 'pane0' }).Count -eq 1) {
+                $ready = $true
+                break
+            }
+        } catch {
+            if ($i -eq 39) { throw }
+        }
         Start-Sleep -Milliseconds 500
     }
     if (-not $ready) { throw "mtty never exposed pane0" }
 
     # Type two commands into the 5.1 pane. `pane run` writes them as keystrokes,
     # so the PSReadLine / PSConsoleHostReadLine hook records each one.
-    Cli @('pane','run','--pane','pane0','--data',"echo alpha-$([guid]::NewGuid().ToString('N').Substring(0,8))`r") | Out-Null
+    Invoke-MttyCli -Arguments @('pane','run','--pane','pane0','--data',"echo alpha-$([guid]::NewGuid().ToString('N').Substring(0,8))`r") | Out-Null
     Start-Sleep -Seconds 2
     $mark = "echo beta-$([guid]::NewGuid().ToString('N').Substring(0,8))"
-    Cli @('pane','run','--pane','pane0','--data',"$mark`r") | Out-Null
+    Invoke-MttyCli -Arguments @('pane','run','--pane','pane0','--data',"$mark`r") | Out-Null
     Start-Sleep -Seconds 2
 
-    $hist = Cli @('history','list')
+    $hist = Invoke-MttyCli -Arguments @('history','list','--pane','pane0')
     $hist | Out-File (Join-Path $base 'history.json') -Encoding utf8
-    $out = Cli @('pane','output','--pane','pane0')
+    $out = Invoke-MttyCli -Arguments @('pane','output','--pane','pane0')
     $out | Out-File (Join-Path $base 'output.txt') -Encoding utf8
 
-    $recorded = $hist -match [regex]::Escape($mark)
+    $history = $hist | ConvertFrom-Json
+    $recorded = @($history.entries | Where-Object {
+        $_.command -eq $mark -and $_.pane_id -eq 'pane0'
+    }).Count -gt 0
     $result = if ($recorded) { 'PASS' } else { 'FAIL' }
     Write-Host ""
     Write-Host "=== $result ===" -ForegroundColor ($(if ($recorded) {'Green'} else {'Red'}))

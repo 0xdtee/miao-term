@@ -13,14 +13,17 @@ and an interactive-only scheduled task cannot start there.
 
 1. Get the v0.1.6 app. From the release page download `mtty-windows-x86_64.zip`
    and extract it (it contains `mtty.exe`, `mtty-cli.exe`, `mtty-ptyhost.exe`).
-2. In a normal desktop PowerShell window, run:
+2. Save your work and close all existing mtty windows first. Windows MTP uses a
+   fixed named pipe, so an already-running instance defeats directory isolation;
+   the script refuses to run while one exists.
+3. In a normal desktop PowerShell window, run:
 
    ```powershell
    powershell -NoProfile -ExecutionPolicy Bypass `
      -File ps51-history-acceptance.ps1 -App <path to>\mtty.exe
    ```
 
-3. The script launches mtty in an isolated state with **Windows PowerShell 5.1**
+4. The script launches mtty in an isolated state with **Windows PowerShell 5.1**
    as the pane shell, types two marked commands into the pane through the shell
    integration, and reads the recorded history back over MTP. It prints
    `PASS`/`FAIL` and writes `history.json` and `output.txt` next to the run.
