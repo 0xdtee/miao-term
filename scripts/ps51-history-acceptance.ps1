@@ -36,8 +36,19 @@ $ps51 = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
 if (-not (Test-Path $ps51)) { throw "Windows PowerShell 5.1 not found at $ps51" }
 $ver = & $ps51 -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
 
-New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
-$base = Join-Path $WorkDir 'run'
+$workRoot = [IO.Path]::GetFullPath($WorkDir)
+$base = Join-Path $workRoot 'run'
+# PTY hosts use AF_UNIX even though the app's MTP endpoint is a named pipe.
+# A long socket path makes the host fail after spawning its shell, then the
+# app falls back to a local shell: history can pass despite a startup error.
+$hostSocket = Join-Path $base ('runtime\mtty-hosts\' + ('0' * 32) + '.sock')
+if ([Text.Encoding]::UTF8.GetByteCount($hostSocket) -ge 108) {
+    throw "WorkDir is too long for the Windows PTY-host socket. Choose a shorter -WorkDir."
+}
+New-Item -ItemType Directory -Force -Path $workRoot | Out-Null
+if ([IO.Path]::GetFullPath($base) -ne [IO.Path]::GetFullPath((Join-Path $workRoot 'run'))) {
+    throw "Refusing to remove a run directory outside WorkDir."
+}
 Remove-Item -Recurse -Force $base -ErrorAction SilentlyContinue
 foreach ($d in 'home','config','data','runtime','tmp') {
     New-Item -ItemType Directory -Force -Path (Join-Path $base $d) | Out-Null
@@ -117,4 +128,19 @@ try {
 }
 finally {
     Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+    # Hosted shells survive app termination by design. End only the hosts
+    # installed inside this isolated run, including their shell children.
+    $hostDir = Join-Path $base 'runtime\mtty-hosts'
+    foreach ($meta in Get-ChildItem -LiteralPath $hostDir -Filter '*.json' -ErrorAction SilentlyContinue) {
+        try {
+            $hostInfo = Get-Content -LiteralPath $meta.FullName -Raw | ConvertFrom-Json
+            $hostProcess = Get-Process -Id $hostInfo.pid -ErrorAction SilentlyContinue
+            $expectedHost = Join-Path $base 'data\mtty\ptyhost\0.1.6\mtty-ptyhost.exe'
+            if ($hostProcess -and $hostProcess.Path -eq $expectedHost) {
+                & "$env:WINDIR\System32\taskkill.exe" /T /F /PID $hostProcess.Id | Out-Null
+            }
+        } catch {
+            Write-Warning "Could not clean up an isolated PTY host: $_"
+        }
+    }
 }

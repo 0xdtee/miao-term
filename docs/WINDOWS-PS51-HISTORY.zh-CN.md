@@ -26,6 +26,11 @@ ssh 会话落在 session 0，`[Environment]::UserInteractive` 为 `False`，
    经 shell 集成向窗格键入两条带标记的命令，并经 MTP 读回已记录的历史。
    它会打印 `PASS`/`FAIL`，并在运行目录旁写出 `history.json` 与 `output.txt`。
 
+`-WorkDir` 应使用短路径：虽然 Windows MTP 使用命名管道，PTY host 仍使用 AF_UNIX
+socket 路径。脚本在启动应用前拒绝达到 108 字节的 host socket 路径。过长路径可能导致
+host 失败并出现 PowerShell 启动错误，而回退的 shell 仍然能记录历史。
+检查结束后，脚本也会结束隔离目录中的 PTY host 及其 shell。
+
 ## “PASS”的含义
 
 第二条键入的命令出现在 `history list` 中——即 5.1 钩子通过 PowerShell 7 所用的同一

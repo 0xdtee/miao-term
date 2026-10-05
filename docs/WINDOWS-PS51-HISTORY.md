@@ -28,6 +28,12 @@ and an interactive-only scheduled task cannot start there.
    integration, and reads the recorded history back over MTP. It prints
    `PASS`/`FAIL` and writes `history.json` and `output.txt` next to the run.
 
+Keep `-WorkDir` short: PTY hosts use AF_UNIX socket paths even though Windows
+MTP uses a named pipe. The script rejects host socket paths of 108 bytes or
+more before launching the app. A long path can make the host fail and show a
+PowerShell startup error while the fallback shell still records history.
+The script also ends the isolated PTY hosts and their shells after the check.
+
 ## What "PASS" means
 
 The second typed command appears in `history list` — i.e. the 5.1 hook recorded
