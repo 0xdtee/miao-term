@@ -92,6 +92,8 @@ impl Segment {
 /// OSC is a notification followed by either Text or Graphics for that sequence.
 pub enum StreamEvent<'a> {
     Text(&'a [u8]),
+    /// Standalone C1 ST. UTF-8 VT parsers may need its ESC-ST equivalent.
+    C1Terminator(&'a [u8]),
     Graphics(Graphic),
     Osc(&'a [u8]),
     CursorReport,
@@ -112,6 +114,12 @@ pub struct Scanner {
 const RETAINED_BUFFER_BYTES: usize = 64 * 1024;
 const CURSOR_QUERY: &[u8] = b"\x1b[6n";
 
+struct StringEnd {
+    end: usize,
+    len: usize,
+    terminated: bool,
+}
+
 impl Scanner {
     pub fn new() -> Self {
         Self::default()
@@ -122,7 +130,9 @@ impl Scanner {
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<Segment> {
         let mut out = Vec::new();
         self.feed_with(bytes, |event| match event {
-            StreamEvent::Text(text) => out.push(Segment::Text(text.to_vec())),
+            StreamEvent::Text(text) | StreamEvent::C1Terminator(text) => {
+                out.push(Segment::Text(text.to_vec()))
+            }
             StreamEvent::Graphics(graphic) => out.push(Segment::Graphics(graphic)),
             StreamEvent::CursorReport => out.push(Segment::Text(CURSOR_QUERY.to_vec())),
             StreamEvent::Osc(_) => {}
@@ -166,18 +176,37 @@ impl Scanner {
                 // Search only the new bytes, including ST split at ESC | '\'.
                 // Never rescan the accumulated image payload.
                 let is_osc = self.buf[1] == b']';
-                let terminator = if self.buf.last() == Some(&0x1b) && bytes.first() == Some(&b'\\')
-                {
-                    Some((0, 1))
+                let terminator = if self.buf.last() == Some(&0x1b) {
+                    if bytes.first() == Some(&b'\\') {
+                        Some(StringEnd {
+                            end: 0,
+                            len: 1,
+                            terminated: true,
+                        })
+                    } else {
+                        // A split ESC starts a new control sequence when it is
+                        // not ST. Keep that ESC for the next scanner iteration.
+                        emit(StreamEvent::Text(&self.buf[..self.buf.len() - 1]));
+                        self.reset();
+                        self.buf.push(0x1b);
+                        continue;
+                    }
                 } else {
                     find_terminator(bytes, 0, is_osc, &mut self.utf8_remaining)
                 };
                 #[cfg(test)]
                 {
-                    self.inspected += terminator.map_or(bytes.len(), |(end, len)| end + len);
+                    self.inspected += terminator
+                        .as_ref()
+                        .map_or(bytes.len(), |end| end.end + end.len);
                 }
-                if let Some((end, len)) = terminator {
-                    if self.buf.len().saturating_add(end + len) <= MAX_SEQUENCE {
+                if let Some(StringEnd {
+                    end,
+                    len,
+                    terminated,
+                }) = terminator
+                {
+                    if terminated && self.buf.len().saturating_add(end + len) <= MAX_SEQUENCE {
                         self.append(&bytes[..end + len]);
                         emit_sequence(&self.buf, &mut emit);
                     } else {
@@ -221,14 +250,18 @@ impl Scanner {
                 }
                 continue;
             }
-            if let Some((end, len)) =
-                find_terminator(bytes, 2, bytes[1] == b']', &mut self.utf8_remaining)
+            if let Some(StringEnd {
+                end,
+                len,
+                terminated,
+            }) = find_terminator(bytes, 2, bytes[1] == b']', &mut self.utf8_remaining)
             {
-                if end + len <= MAX_SEQUENCE {
+                if terminated && end + len <= MAX_SEQUENCE {
                     emit_sequence(&bytes[..end + len], &mut emit);
                 } else {
                     emit(StreamEvent::Text(&bytes[..end + len]));
                 }
+                self.reset();
                 bytes = &bytes[end + len..];
             } else {
                 #[cfg(test)]
@@ -237,6 +270,7 @@ impl Scanner {
                 }
                 if bytes.len() > MAX_SEQUENCE {
                     emit(StreamEvent::Text(bytes));
+                    self.reset();
                 } else {
                     self.append(bytes);
                 }
@@ -274,6 +308,10 @@ fn emit_sequence(sequence: &[u8], emit: &mut impl FnMut(StreamEvent<'_>)) {
     }
     match classify(payload) {
         Some(graphic) => emit(StreamEvent::Graphics(graphic)),
+        None if sequence.ends_with(b"\x9c") => {
+            emit(StreamEvent::Text(&sequence[..sequence.len() - 1]));
+            emit(StreamEvent::C1Terminator(&sequence[sequence.len() - 1..]));
+        }
         None => emit(StreamEvent::Text(sequence)),
     }
 }
@@ -295,13 +333,14 @@ fn find_intro(s: &[u8]) -> Option<usize> {
 }
 
 /// Find the end of a sequence body starting at `from`. Returns `(end, term_len)`
-/// where `end` is exclusive of the terminator.
+/// where `end` is exclusive of the terminator or cancellation. A new ESC
+/// sequence cancels the old string without consuming its introducer.
 fn find_terminator(
     s: &[u8],
     from: usize,
     is_osc: bool,
     utf8_remaining: &mut u8,
-) -> Option<(usize, usize)> {
+) -> Option<StringEnd> {
     let mut k = from;
     while k < s.len() {
         // C1 ST (0x9c) is also a UTF-8 continuation byte, for example in
@@ -318,9 +357,35 @@ fn find_terminator(
             0xc2..=0xdf => *utf8_remaining = 1,
             0xe0..=0xef => *utf8_remaining = 2,
             0xf0..=0xf4 => *utf8_remaining = 3,
-            0x1b if k + 1 < s.len() && s[k + 1] == b'\\' => return Some((k, 2)),
-            0x9c => return Some((k, 1)),
-            0x07 if is_osc => return Some((k, 1)),
+            0x1b if k + 1 < s.len() => {
+                let terminated = s[k + 1] == b'\\';
+                return Some(StringEnd {
+                    end: k,
+                    len: if terminated { 2 } else { 0 },
+                    terminated,
+                });
+            }
+            0x18 | 0x1a => {
+                return Some(StringEnd {
+                    end: k,
+                    len: 1,
+                    terminated: false,
+                })
+            }
+            0x9c => {
+                return Some(StringEnd {
+                    end: k,
+                    len: 1,
+                    terminated: true,
+                })
+            }
+            0x07 if is_osc => {
+                return Some(StringEnd {
+                    end: k,
+                    len: 1,
+                    terminated: true,
+                })
+            }
             _ => {}
         }
         k += 1;
@@ -558,7 +623,7 @@ mod tests {
         let mut out = Vec::new();
         for chunk in bytes.chunks(chunk_size) {
             scanner.feed_with(chunk, |event| match event {
-                StreamEvent::Text(text) => {
+                StreamEvent::Text(text) | StreamEvent::C1Terminator(text) => {
                     if let Some(OwnedEvent::Text(previous)) = out.last_mut() {
                         previous.extend_from_slice(text);
                     } else {
@@ -600,6 +665,51 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn cancelled_strings_do_not_swallow_the_next_title_at_any_chunk_size() {
+        for intro in [b"\x1b]2;".as_slice(), b"\x1bP", b"\x1b_"] {
+            for cancellation in [b"\x18".as_slice(), b"\x1a", b""] {
+                let mut stream = intro.to_vec();
+                stream.extend_from_slice("中断相机".as_bytes());
+                stream.extend_from_slice(cancellation);
+                let aborted = stream.clone();
+                stream.extend_from_slice(b"\x1b]2;fresh\x07after");
+                let expected = vec![
+                    OwnedEvent::Text(aborted),
+                    OwnedEvent::Osc(b"2;fresh".to_vec()),
+                    OwnedEvent::Text(b"\x1b]2;fresh\x07after".to_vec()),
+                ];
+                for size in 1..=stream.len() {
+                    assert_eq!(
+                        events(&stream, size),
+                        expected,
+                        "intro {intro:?}, size {size}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_unfinished_string_resets_utf8_state_before_the_next_title() {
+        let mut stream = b"\x1b]2;".to_vec();
+        stream.resize(MAX_SEQUENCE + 1, b'a');
+        stream.push(0xe6);
+        let mut scanner = Scanner::new();
+        scanner.feed_with(&stream, |event| {
+            assert!(matches!(event, StreamEvent::Text(_)))
+        });
+        assert!(scanner.buf.is_empty());
+        assert_eq!(scanner.utf8_remaining, 0);
+        let mut titles = Vec::new();
+        scanner.feed_with(b"\x1b]2;fresh\x9c", |event| {
+            if let StreamEvent::Osc(title) = event {
+                titles.push(title.to_vec());
+            }
+        });
+        assert_eq!(titles, [b"2;fresh".to_vec()]);
     }
 
     #[test]
