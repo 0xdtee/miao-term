@@ -25,6 +25,7 @@ pub mod markdown;
 pub mod menu;
 pub mod mermaid;
 pub mod palette;
+pub mod project;
 pub mod remote_control;
 pub mod selection;
 pub mod sftp;
