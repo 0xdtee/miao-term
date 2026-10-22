@@ -2557,6 +2557,9 @@ impl State {
             }
             if let Some(note) = pane.pending_note.take() {
                 pane.term.screen_mut().process(note.as_bytes());
+                // Replayed contents are history, not the fresh shell's live
+                // screen. ConPTY redraws that screen with absolute positions.
+                pane.term.screen_mut().finish_history_restore();
             }
         }
     }
